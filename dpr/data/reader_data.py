@@ -36,10 +36,12 @@ class ReaderPassage(object):
                  has_answer: bool = None):
         self.id = id
         # string passage representations
-        self.passage_text = text
+        if text is not None:
+            self.passage_text = ' context: ' + text + '\n'
         self.title = title
         self.score = score
         self.has_answer = has_answer
+        self.answers_token_ids = None
         self.passage_token_ids = None
         # offset of the actual passage (i.e. not a question or may be title) in the sequence_ids
         self.passage_offset = None
@@ -100,10 +102,19 @@ DEFAULT_PREPROCESSING_CFG_TRAIN = ReaderPreprocessingCfg(use_tailing_sep=False, 
 DEFAULT_EVAL_PASSAGES = 100
 
 
+original_dataset_qa = {}
+with open('NQ-open.train.jsonl','r') as f:
+    for line in f:
+        currjson = json.loads(line)
+        original_dataset_qa[currjson['question']] = [a.replace('\u00a0',' ') for a in currjson['answer']]
+with open('NQ-open.dev.jsonl','r') as f:
+    for line in f:
+        currjson = json.loads(line)
+        original_dataset_qa[currjson['question']] = [a.replace('\u00a0',' ') for a in currjson['answer']]
+
 def preprocess_retriever_data(samples: List[Dict], gold_info_file: Optional[str], tensorizer: Tensorizer,
                               cfg: ReaderPreprocessingCfg = DEFAULT_PREPROCESSING_CFG_TRAIN,
-                              is_train_set: bool = True,
-                              ) -> Iterable[ReaderSample]:
+                              is_train_set: bool = True) -> Iterable[ReaderSample]:
     """
     Converts retriever results into reader training data.
     :param samples: samples from the retriever's json file results
@@ -113,26 +124,24 @@ def preprocess_retriever_data(samples: List[Dict], gold_info_file: Optional[str]
     :param is_train_set: if the data should be processed as a train set
     :return: iterable of ReaderSample objects which can be consumed by the reader model
     """
-    sep_tensor = tensorizer.get_pair_separator_ids()  # separator can be a multi token
-
+    
+    assert gold_info_file is not None
     gold_passage_map, canonical_questions = _get_gold_ctx_dict(gold_info_file) if gold_info_file else ({}, {})
 
     no_positive_passages = 0
     positives_from_gold = 0
 
     def create_reader_sample_ids(sample: ReaderPassage, question: str):
-        question_and_title = tensorizer.text_to_tensor(sample.title, title=question, add_special_tokens=True)
+        sample.title = "title: " + sample.title
+        question = "question: " + question
+        question_and_title = tensorizer.text_to_tensor(question + ' ' + sample.title)
         if sample.passage_token_ids is None:
-            sample.passage_token_ids = tensorizer.text_to_tensor(sample.passage_text, add_special_tokens=False)
+            sample.passage_token_ids = tensorizer.text_to_tensor(sample.passage_text)
 
         all_concatenated, shift = _concat_pair(question_and_title, sample.passage_token_ids,
-                                               tailing_sep=sep_tensor if cfg.use_tailing_sep else None)
+                                               tailing_sep=None)
 
         sample.sequence_ids = all_concatenated
-        sample.passage_offset = shift
-        assert shift > 1
-        if sample.has_answer and is_train_set:
-            sample.answers_spans = [(span[0] + shift, span[1] + shift) for span in sample.answers_spans]
         return sample
 
     for sample in samples:
@@ -140,34 +149,26 @@ def preprocess_retriever_data(samples: List[Dict], gold_info_file: Optional[str]
 
         if question in canonical_questions:
             question = canonical_questions[question]
+        else:
+            print('not in canonical!', question)
 
-        positive_passages, negative_passages = _select_reader_passages(sample, question,
-                                                                       tensorizer,
-                                                                       gold_passage_map,
-                                                                       cfg.gold_page_only_positives,
-                                                                       cfg.max_positives, cfg.max_negatives,
-                                                                       cfg.min_negatives,
-                                                                       cfg.max_retriever_passages,
-                                                                       cfg.include_gold_passage,
-                                                                       is_train_set,
-                                                                       )
-        # create concatenated sequence ids for each passage and adjust answer spans
-        positive_passages = [create_reader_sample_ids(s, question) for s in positive_passages]
-        negative_passages = [create_reader_sample_ids(s, question) for s in negative_passages]
-
-        if is_train_set and len(positive_passages) == 0:
-            no_positive_passages += 1
-            if cfg.skip_no_positves:
-                continue
-
-        if next(iter(ctx for ctx in positive_passages if ctx.score == -1), None):
+        sample['answers'] = original_dataset_qa[question]
+        
+        passages = _select_reader_passages(sample, question,
+                                           tensorizer,
+                                           gold_passage_map,
+                                           cfg.gold_page_only_positives,
+                                           cfg.max_positives, cfg.max_negatives,
+                                           cfg.min_negatives,
+                                           cfg.max_retriever_passages,
+                                           cfg.include_gold_passage,
+                                           is_train_set,
+                                           )
+        passages = [create_reader_sample_ids(s, question) for s in passages]
+        if next(iter(ctx for ctx in passages if ctx.score == -1), None):
             positives_from_gold += 1
 
-        if is_train_set:
-            yield ReaderSample(question, sample['answers'], positive_passages=positive_passages,
-                               negative_passages=negative_passages)
-        else:
-            yield ReaderSample(question, sample['answers'], passages=negative_passages)
+        yield ReaderSample(question, sample['answers'], passages=passages)
 
     logger.info('no positive passages samples: %d', no_positive_passages)
     logger.info('positive passages from gold samples: %d', positives_from_gold)
@@ -268,64 +269,12 @@ def _select_reader_passages(sample: Dict,
 
     ctxs = [ReaderPassage(**ctx) for ctx in sample['ctxs']][0:max_retriever_passages]
     answers_token_ids = [tensorizer.text_to_tensor(a, add_special_tokens=False) for a in answers]
-
     if is_train_set:
-        positive_samples = list(filter(lambda ctx: ctx.has_answer, ctxs))
-        negative_samples = list(filter(lambda ctx: not ctx.has_answer, ctxs))
-    else:
-        positive_samples = []
-        negative_samples = ctxs
+        for ctx in ctxs:
+            ctx.answers_token_ids = answers_token_ids
 
-    positive_ctxs_from_gold_page = list(
-        filter(lambda ctx: _is_from_gold_wiki_page(gold_passage_map, ctx.title, question),
-               positive_samples)) if gold_page_only_positives else []
-
-    def find_answer_spans(ctx: ReaderPassage):
-        if ctx.has_answer:
-            if ctx.passage_token_ids is None:
-                ctx.passage_token_ids = tensorizer.text_to_tensor(ctx.passage_text, add_special_tokens=False)
-
-            answer_spans = [_find_answer_positions(ctx.passage_token_ids, answers_token_ids[i]) for i in
-                            range(len(answers))]
-
-            # flatten spans list
-            answer_spans = [item for sublist in answer_spans for item in sublist]
-            answers_spans = list(filter(None, answer_spans))
-            ctx.answers_spans = answers_spans
-
-            if not answers_spans:
-                logger.warning('No answer found in passage id=%s text=%s, answers=%s, question=%s', ctx.id,
-                               ctx.passage_text,
-                               answers, question)
-
-            ctx.has_answer = bool(answers_spans)
-
-        return ctx
-
-    # check if any of the selected ctx+ has answer spans
-    selected_positive_ctxs = list(
-        filter(lambda ctx: ctx.has_answer, [find_answer_spans(ctx) for ctx in positive_ctxs_from_gold_page]))
-
-    if not selected_positive_ctxs:  # fallback to positive ctx not from gold pages
-        selected_positive_ctxs = list(
-            filter(lambda ctx: ctx.has_answer, [find_answer_spans(ctx) for ctx in positive_samples])
-        )[0:max_positives]
-
-    # optionally include gold passage itself if it is still not in the positives list
-    if include_gold_passage and question in gold_passage_map:
-        gold_passage = gold_passage_map[question]
-        included_gold_passage = next(iter(ctx for ctx in selected_positive_ctxs if ctx.id == gold_passage.id), None)
-        if not included_gold_passage:
-            gold_passage = find_answer_spans(gold_passage)
-            if not gold_passage.has_answer:
-                logger.warning('No answer found in gold passage %s', gold_passage)
-            else:
-                selected_positive_ctxs.append(gold_passage)
-
-    max_negatives = min(max(10 * len(selected_positive_ctxs), max1_negatives),
-                        max2_negatives) if is_train_set else DEFAULT_EVAL_PASSAGES
-    negative_samples = negative_samples[0:max_negatives]
-    return selected_positive_ctxs, negative_samples
+    samples = ctxs[0:max_retriever_passages]
+    return samples
 
 
 def _find_answer_positions(ctx_ids: T, answer: T) -> List[Tuple[int, int]]:
@@ -420,3 +369,4 @@ def _preprocess_reader_samples_chunk(samples: List, out_file_prefix: str, gold_p
         logger.info('Serialize %d results to %s', len(results), out_file)
         pickle.dump(results, f)
     return out_file
+

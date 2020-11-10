@@ -16,6 +16,7 @@ import glob
 import json
 import logging
 import os
+
 from collections import defaultdict
 from typing import List
 
@@ -41,7 +42,6 @@ console = logging.StreamHandler()
 logger.addHandler(console)
 
 ReaderQuestionPredictions = collections.namedtuple('ReaderQuestionPredictions', ['id', 'predictions', 'gold_answers'])
-
 
 class ReaderTrainer(object):
     def __init__(self, args):
@@ -153,8 +153,10 @@ class ReaderTrainer(object):
 
         log_result_step = args.log_batch_step
         all_results = []
+        all_answers = []
 
         eval_top_docs = args.eval_top_docs
+
         for i, samples_batch in enumerate(data_iterator.iterate_data()):
             input = create_reader_input(self.tensorizer.get_pad_id(),
                                         samples_batch,
@@ -164,31 +166,29 @@ class ReaderTrainer(object):
                                         is_train=False, shuffle=False)
 
             input = ReaderBatch(**move_to_device(input._asdict(), args.device))
-            attn_mask = self.tensorizer.get_attn_mask(input.input_ids)
+            input_attn_mask = self.tensorizer.get_attn_mask(input.input_ids)
 
             with torch.no_grad():
-                start_logits, end_logits, relevance_logits = self.reader(input.input_ids, attn_mask)
-
-            batch_predictions = self._get_best_prediction(start_logits, end_logits, relevance_logits, samples_batch,
-                                                          passage_thresholds=eval_top_docs)
+                generated_ids = self.reader(input.input_ids, input_attn_mask)
+                batch_predictions = self.tensorizer.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
             all_results.extend(batch_predictions)
+            for i in range(len(samples_batch)):
+                all_answers.append(samples_batch[i].answers)
 
             if (i + 1) % log_result_step == 0:
                 logger.info('Eval step: %d ', i)
 
         ems = defaultdict(list)
-
-        for q_predictions in all_results:
-            gold_answers = q_predictions.gold_answers
-            span_predictions = q_predictions.predictions  # {top docs threshold -> SpanPrediction()}
-            for (n, span_prediction) in span_predictions.items():
-                em_hit = max([exact_match_score(span_prediction.prediction_text, ga) for ga in gold_answers])
-                ems[n].append(em_hit)
+        for prediction, gold_answers in zip(all_results, all_answers):
+            em_hit = max([exact_match_score(prediction, ga) for ga in gold_answers])
+            ems[0].append(em_hit)
         em = 0
         for n in sorted(ems.keys()):
             em = np.mean(ems[n])
             logger.info("n=%d\tEM %.2f" % (n, em * 100))
+        print(all_results[0:5])
+        print(all_answers[0:5])
 
         if args.prediction_results_file:
             self._save_predictions(args.prediction_results_file, all_results)
@@ -197,6 +197,7 @@ class ReaderTrainer(object):
 
     def _train_epoch(self, scheduler, epoch: int, eval_step: int,
                      train_data_iterator: ShardedDataIterator, global_step: int):
+        
         args = self.args
         rolling_train_loss = 0.0
         epoch_loss = 0
@@ -354,23 +355,12 @@ class ReaderTrainer(object):
     def _calc_loss(self, input: ReaderBatch) -> torch.Tensor:
         args = self.args
         input = ReaderBatch(**move_to_device(input._asdict(), args.device))
-        attn_mask = self.tensorizer.get_attn_mask(input.input_ids)
-        questions_num, passages_per_question, _ = input.input_ids.size()
+        input_attn_mask = self.tensorizer.get_attn_mask(input.input_ids)
+        decoder_attn_mask = self.tensorizer.get_attn_mask(input.answers_token_ids)
 
-        if self.reader.training:
-            # start_logits, end_logits, rank_logits = self.reader(input.input_ids, attn_mask)
-            loss = self.reader(input.input_ids, attn_mask, input.start_positions, input.end_positions,
-                               input.answers_mask)
+        assert self.reader.training
+        loss = self.reader(input.input_ids, input_attn_mask, decoder_attn_mask, input.answers_token_ids)
 
-        else:
-            # TODO: remove?
-            with torch.no_grad():
-                start_logits, end_logits, rank_logits = self.reader(input.input_ids, attn_mask)
-
-            loss = compute_loss(input.start_positions, input.end_positions, input.answers_mask, start_logits,
-                                end_logits,
-                                rank_logits,
-                                questions_num, passages_per_question)
         if args.n_gpu > 1:
             loss = loss.mean()
         if args.gradient_accumulation_steps > 1:
@@ -399,7 +389,7 @@ class ReaderTrainer(object):
             return serialized_files
 
         gold_passages_src = None
-        if self.args.gold_passages_src:
+        if self.args.gold_passages_src or self.args.gold_passages_src_dev:
             gold_passages_src = self.args.gold_passages_src if is_train else self.args.gold_passages_src_dev
             assert os.path.exists(gold_passages_src), 'Please specify valid gold_passages_src/gold_passages_src_dev'
         logger.info('Data are not preprocessed for reader training. Start pre-processing ...')
@@ -505,3 +495,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

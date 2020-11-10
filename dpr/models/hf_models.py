@@ -16,13 +16,16 @@ import torch
 from torch import Tensor as T
 from torch import nn
 from transformers.modeling_bert import BertConfig, BertModel
+from transformers.modeling_t5 import T5ForConditionalGeneration, T5ForConditionalGenerationWithDecoderFusion
+from transformers.tokenization_t5 import T5Tokenizer
 from transformers.optimization import AdamW
 from transformers.tokenization_bert import BertTokenizer
 from transformers.tokenization_roberta import RobertaTokenizer
 
+
 from dpr.utils.data_utils import Tensorizer
 from .biencoder import BiEncoder
-from .reader import Reader
+from .reader import Reader, T5Reader
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +72,27 @@ def get_bert_tensorizer(args, tokenizer=None):
         tokenizer = get_bert_tokenizer(args.pretrained_model_cfg, do_lower_case=args.do_lower_case)
     return BertTensorizer(tokenizer, args.sequence_length)
 
+def get_t5_reader_components(args, inference_only: bool = False, **kwargs):
+    if 'fid' in args.pretrained_model_cfg:
+        args.pretrained_model_cfg = args.pretrained_model_cfg.split('-fid')[0]
+        encoder = T5ForConditionalGenerationWithDecoderFusion.from_pretrained(args.pretrained_model_cfg)
+    else:
+        encoder = T5ForConditionalGeneration.from_pretrained(args.pretrained_model_cfg)
+    reader = T5Reader(encoder)
+
+    optimizer = get_optimizer(reader,
+                              learning_rate=args.learning_rate,
+                              adam_eps=args.adam_eps, weight_decay=args.weight_decay,
+                              ) if not inference_only else None
+
+    tensorizer = get_t5_tensorizer(args)
+    return tensorizer, reader, optimizer
+
+def get_t5_tensorizer(args, tokenizer=None):
+    if not tokenizer:
+        assert not args.do_lower_case
+        tokenizer = T5Tokenizer.from_pretrained(args.pretrained_model_cfg)
+    return T5Tensorizer(tokenizer, args.sequence_length)
 
 def get_roberta_tensorizer(args, tokenizer=None):
     if not tokenizer:
@@ -185,3 +209,19 @@ class BertTensorizer(Tensorizer):
 class RobertaTensorizer(BertTensorizer):
     def __init__(self, tokenizer, max_length: int, pad_to_max: bool = True):
         super(RobertaTensorizer, self).__init__(tokenizer, max_length, pad_to_max=pad_to_max)
+
+
+class T5Tensorizer(BertTensorizer):
+    def __init__(self, tokenizer, max_length: int, pad_to_max: bool = True):
+        super(T5Tensorizer, self).__init__(tokenizer, max_length, pad_to_max=pad_to_max)
+
+    def text_to_tensor(self, text: str, pad_to_max = False):
+        token_ids = self.tokenizer.encode(text, add_special_tokens=False, max_length=self.max_length, truncation=True)
+
+        seq_len = self.max_length
+        if self.pad_to_max and len(token_ids) < seq_len:
+            token_ids = token_ids + [self.tokenizer.pad_token_id] * (seq_len - len(token_ids))
+        if len(token_ids) > seq_len:
+            token_ids = token_ids[0:seq_len]
+
+        return torch.tensor(token_ids)
