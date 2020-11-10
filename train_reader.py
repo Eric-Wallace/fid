@@ -157,6 +157,10 @@ class ReaderTrainer(object):
 
         eval_top_docs = args.eval_top_docs
 
+        if args.n_gpu > 1 and args.local_rank == -1:
+            self.reader = self.reader.module
+            self.reader = self.reader.cpu()
+            self.reader = self.reader.cuda()
         for i, samples_batch in enumerate(data_iterator.iterate_data()):
             input = create_reader_input(self.tensorizer.get_pad_id(),
                                         samples_batch,
@@ -189,6 +193,9 @@ class ReaderTrainer(object):
             logger.info("n=%d\tEM %.2f" % (n, em * 100))
         print(all_results[0:5])
         print(all_answers[0:5])
+
+        if args.n_gpu > 1 and args.local_rank == -1:
+            self.reader = torch.nn.DataParallel(self.reader)
 
         if args.prediction_results_file:
             self._save_predictions(args.prediction_results_file, all_results)

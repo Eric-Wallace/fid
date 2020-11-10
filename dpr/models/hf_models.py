@@ -75,9 +75,9 @@ def get_bert_tensorizer(args, tokenizer=None):
 def get_t5_reader_components(args, inference_only: bool = False, **kwargs):
     if 'fid' in args.pretrained_model_cfg:
         args.pretrained_model_cfg = args.pretrained_model_cfg.split('-fid')[0]
-        encoder = T5ForConditionalGenerationWithDecoderFusion.from_pretrained(args.pretrained_model_cfg)
+        encoder = T5ForConditionalGenerationWithDecoderFusion.from_pretrained(args.pretrained_model_cfg, checkpoint_gradients=args.checkpoint_gradients)
     else:
-        encoder = T5ForConditionalGeneration.from_pretrained(args.pretrained_model_cfg)
+        encoder = T5ForConditionalGeneration.from_pretrained(args.pretrained_model_cfg, checkpoint_gradients=args.checkpoint_gradients)
     reader = T5Reader(encoder)
 
     optimizer = get_optimizer(reader,

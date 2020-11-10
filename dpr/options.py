@@ -70,6 +70,7 @@ def add_training_params(parser: argparse.ArgumentParser):
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
     parser.add_argument("--num_train_epochs", default=3.0, type=float,
                         help="Total number of training epochs to perform.")
+    parser.add_argument('--checkpoint_gradients', action='store_true', default=False)
 
 
 def add_cuda_params(parser: argparse.ArgumentParser):
@@ -119,6 +120,9 @@ def set_encoder_params_from_state(state, args):
 
     override_params = [(param, state[param]) for param in params_to_save if param in state and state[param]]
     for param, value in override_params:
+        if param == 'sequence_length':
+            logger.warning('Using the passed in sequence_length, rather than the checkpoint one')
+            continue
         if hasattr(args, param):
             logger.warning('Overriding args parameter value from checkpoint state. Param = %s, value = %s', param,
                            value)

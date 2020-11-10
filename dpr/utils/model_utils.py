@@ -44,7 +44,7 @@ def setup_for_distributed_mode(model: nn.Module, optimizer: torch.optim.Optimize
     if local_rank != -1:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
                                                           output_device=local_rank,
-                                                          find_unused_parameters=True)
+                                                          find_unused_parameters=False)
     return model, optimizer
 
 

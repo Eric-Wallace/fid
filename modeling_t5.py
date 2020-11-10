@@ -486,7 +486,7 @@ class T5LayerCrossAttention(nn.Module):
 
 
 class T5Block(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False):
+    def __init__(self, config, has_relative_attention_bias=False, checkpoint_gradients=False):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.layer = nn.ModuleList()
@@ -495,6 +495,8 @@ class T5Block(nn.Module):
             self.layer.append(T5LayerCrossAttention(config, has_relative_attention_bias=has_relative_attention_bias))
 
         self.layer.append(T5LayerFF(config))
+        self.checkpoint_gradients = checkpoint_gradients
+
 
     def forward(
         self,
@@ -571,7 +573,10 @@ class T5Block(nn.Module):
 
         # Add attentions if we output them
         outputs = outputs + (present_key_value_state,) + attention_outputs
-        return outputs  # hidden-states, present_key_value_states, (self-attention weights), (self-attention position bias), (cross-attention weights), (cross-attention position bias)
+        if self.is_decoder and self.checkpoint_gradients and self.layer[0].training:
+            return (hidden_states,) + present_key_value_state + attention_outputs
+        else:
+            return outputs  # hidden-states, present_key_value_states, (self-attention weights), (self-attention position bias), (cross-attention weights), (cross-attention position bias)
 
 
 class T5PreTrainedModel(PreTrainedModel):
@@ -649,19 +654,20 @@ class T5PreTrainedModel(PreTrainedModel):
 
 
 class T5Stack(T5PreTrainedModel):
-    def __init__(self, config, embed_tokens=None):
+    def __init__(self, config, embed_tokens=None, checkpoint_gradients=False):
         super().__init__(config)
 
         self.embed_tokens = embed_tokens
         self.is_decoder = config.is_decoder
 
         self.block = nn.ModuleList(
-            [T5Block(config, has_relative_attention_bias=bool(i == 0)) for i in range(config.num_layers)]
+            [T5Block(config, has_relative_attention_bias=bool(i == 0), checkpoint_gradients=checkpoint_gradients) for i in range(config.num_layers)]
         )
         self.final_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
         self.init_weights()
+        self.checkpoint_gradients = checkpoint_gradients
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -756,18 +762,46 @@ class T5Stack(T5PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            layer_outputs = layer_module(
-                hidden_states,
-                attention_mask=extended_attention_mask,
-                position_bias=position_bias,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_extended_attention_mask,
-                encoder_decoder_position_bias=encoder_decoder_position_bias,
-                head_mask=head_mask[i],
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-            )
+            if self.checkpoint_gradients and self.final_layer_norm.training:
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        # checkpointing only works with tuple returns, not with lists
+                        return tuple(output for output in module(*inputs, use_cache, output_attentions) if output is not None)
+                    return custom_forward
+
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(layer_module),
+                    hidden_states,
+                    extended_attention_mask,
+                    position_bias,
+                    encoder_hidden_states,
+                    encoder_extended_attention_mask,
+                    encoder_decoder_position_bias,
+                    head_mask[i],
+                    past_key_value,
+                )
+                if len(layer_outputs) == 7:
+                    layer_outputs = (layer_outputs[0], layer_outputs[1:5], layer_outputs[5], layer_outputs[6])
+                elif len(layer_outputs) == 5:
+                    layer_outputs = (layer_outputs[0], layer_outputs[1:5], None, None)
+                else:
+                    print(len(layer_outputs))
+                    exit('error in modeling_t5 at this line') 
+
+            else:
+                layer_outputs = layer_module(
+                    hidden_states,
+                    attention_mask=extended_attention_mask,
+                    position_bias=position_bias,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_extended_attention_mask,
+                    encoder_decoder_position_bias=encoder_decoder_position_bias,
+                    head_mask=head_mask[i],
+                    past_key_value=past_key_value,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                )
+
             # layer_outputs is a tuple with:
             # hidden-states, key-value-states, (self-attention weights), (self-attention position bias), (cross-attention weights), (cross-attention position bias)
             hidden_states, present_key_value_state = layer_outputs[:2]
@@ -798,28 +832,37 @@ class T5Stack(T5PreTrainedModel):
                 for v in [hidden_states, present_key_value_states, all_hidden_states, all_attentions]
                 if v is not None
             )
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=present_key_value_states,
-            hidden_states=all_hidden_states,
-            attentions=all_attentions,
-        )
+        if not self.is_decoder:
+            return BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=present_key_value_states,
+                hidden_states=all_hidden_states,
+                attentions=all_attentions,
+            ), None
+        else:
+            return BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=present_key_value_states,
+                hidden_states=all_hidden_states,
+                attentions=all_attentions,
+            )
+
 
 
 class T5StackFID(T5PreTrainedModel):
-    def __init__(self, config, embed_tokens=None):
+    def __init__(self, config, embed_tokens=None, checkpoint_gradients=False):
         super().__init__(config)
 
         self.embed_tokens = embed_tokens
         self.is_decoder = config.is_decoder
-        self.new_attention_mask = {}
         self.block = nn.ModuleList(
-            [T5Block(config, has_relative_attention_bias=bool(i == 0)) for i in range(config.num_layers)]
+            [T5Block(config, has_relative_attention_bias=bool(i == 0), checkpoint_gradients=checkpoint_gradients) for i in range(config.num_layers)]
         )
         self.final_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
         self.init_weights()
+        self.checkpoint_gradients = checkpoint_gradients
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -844,6 +887,7 @@ class T5StackFID(T5PreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
     ):
+        assert not self.is_decoder
         new_input_ids = []
         for batch_size_id in range(input_ids.shape[0]):                
             # find positions wheres its 'question:'
@@ -859,10 +903,6 @@ class T5StackFID(T5PreTrainedModel):
                 new_input_ids.append(new_tensor.squeeze())
         new_input_ids = pad_sequence(new_input_ids, batch_first=True)
         for batch_size_id in range(new_input_ids.shape[0]):
-            if new_input_ids[batch_size_id][0] != 822:
-                print(new_input_ids[batch_size_id])
-            if new_input_ids[batch_size_id][1] != 10:
-                print(new_input_ids[batch_size_id])
             assert new_input_ids[batch_size_id][0] == 822
             assert new_input_ids[batch_size_id][1] == 10
         ratio = int(new_input_ids.shape[0] / input_ids.shape[0])
@@ -938,12 +978,11 @@ class T5StackFID(T5PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
             
-            if True:#getattr(self.config, "gradient_checkpointing") and self.final_layer_norm.training:
+            if self.checkpoint_gradients and self.final_layer_norm.training:
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # checkpointing only works with tuple returns, not with lists
                         return tuple(output for output in module(*inputs, use_cache, output_attentions) if output is not None)
-                        # return module(*inputs)
                     return custom_forward
 
                 assert use_cache == False
@@ -959,12 +998,14 @@ class T5StackFID(T5PreTrainedModel):
                     head_mask[i],
                     past_key_value,
                 )
+                # checkpointing doesnt like None return values, so we strip out nones in the custom_forward above
+                # and then add them back here
                 if len(layer_outputs) == 1:
                     layer_outputs = (layer_outputs[0], None, None)
                 elif len(layer_outputs) == 2:
                     layer_outputs = (layer_outputs[0], None, layer_outputs[1])
                 else:
-                    import pdb; pdb.set_trace()
+                    exit('failure in modeling_t5')
 
             else:
                 layer_outputs = layer_module(
@@ -979,8 +1020,6 @@ class T5StackFID(T5PreTrainedModel):
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                 )
-                # import pdb; pdb.set_trace()
-                # pass
 
             # layer_outputs is a tuple with:
             # hidden-states, key-value-states, (self-attention weights), (self-attention position bias), (cross-attention weights), (cross-attention position bias)
@@ -1021,15 +1060,23 @@ class T5StackFID(T5PreTrainedModel):
             else:
                 new_hidden_states = torch.cat((new_hidden_states, hidden_states[i*ratio:(i+1)*ratio].view(1, -1, hidden_states.shape[-1])), dim=0)
                 new_attention_mask = torch.cat((new_attention_mask, attention_mask[i*ratio:(i+1)*ratio].view(1, -1)), dim=0)
-        hidden_states = new_hidden_states                
-        self.new_attention_mask[hidden_states.device.index] = new_attention_mask
+        hidden_states = new_hidden_states
 
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=present_key_value_states,
-            hidden_states=all_hidden_states,
-            attentions=all_attentions,
-        )        
+        if not self.is_decoder:
+            return BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=present_key_value_states,
+                hidden_states=all_hidden_states,
+                attentions=all_attentions,
+            ), new_attention_mask
+        else:
+            return BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=present_key_value_states,
+                hidden_states=all_hidden_states,
+                attentions=all_attentions,
+            )
+
 
 
 T5_START_DOCSTRING = r"""
@@ -1231,7 +1278,7 @@ class T5Model(T5PreTrainedModel):
 
         # Encode if needed (training, first prediction pass)
         if encoder_outputs is None:
-            encoder_outputs = self.encoder(
+            encoder_outputs, _ = self.encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 inputs_embeds=inputs_embeds,
@@ -1282,7 +1329,7 @@ class T5Model(T5PreTrainedModel):
 class T5ForConditionalGeneration(T5PreTrainedModel):
     authorized_missing_keys = [r"encoder\.embed_tokens\.weight", r"decoder\.embed_tokens\.weight", r"lm_head\.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, checkpoint_gradients=False):
         super().__init__(config)
         self.model_dim = config.d_model
 
@@ -1291,13 +1338,13 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         encoder_config = copy.deepcopy(config)
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
-        self.encoder = T5Stack(encoder_config, self.shared)
+        self.encoder = T5Stack(encoder_config, self.shared, checkpoint_gradients)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
         decoder_config.num_layers = config.num_decoder_layers
-        self.decoder = T5Stack(decoder_config, self.shared)
+        self.decoder = T5Stack(decoder_config, self.shared, checkpoint_gradients)
 
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
@@ -1394,7 +1441,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         # Encode if needed (training, first prediction pass)
         if encoder_outputs is None:
             # Convert encoder inputs in embeddings if needed
-            encoder_outputs = self.encoder(
+            encoder_outputs, _  = self.encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 inputs_embeds=inputs_embeds,
@@ -1510,7 +1557,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
 class T5ForConditionalGenerationWithDecoderFusion(T5PreTrainedModel):
     authorized_missing_keys = [r"encoder\.embed_tokens\.weight", r"decoder\.embed_tokens\.weight", r"lm_head\.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, checkpoint_gradients=False):
         super().__init__(config)
         self.model_dim = config.d_model
 
@@ -1519,13 +1566,13 @@ class T5ForConditionalGenerationWithDecoderFusion(T5PreTrainedModel):
         encoder_config = copy.deepcopy(config)
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
-        self.encoder = T5StackFID(encoder_config, self.shared)
+        self.encoder = T5StackFID(encoder_config, self.shared, checkpoint_gradients)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
         decoder_config.num_layers = config.num_decoder_layers
-        self.decoder = T5Stack(decoder_config, self.shared)
+        self.decoder = T5Stack(decoder_config, self.shared, checkpoint_gradients)
 
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
@@ -1621,7 +1668,7 @@ class T5ForConditionalGenerationWithDecoderFusion(T5PreTrainedModel):
 
         # Encode if needed (training, first prediction pass)
         if encoder_outputs is None:
-            encoder_outputs = self.encoder(
+            encoder_outputs, attention_mask = self.encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 inputs_embeds=inputs_embeds,
@@ -1638,7 +1685,6 @@ class T5ForConditionalGenerationWithDecoderFusion(T5PreTrainedModel):
             )
 
         hidden_states = encoder_outputs[0]
-        attention_mask = self.encoder.new_attention_mask[hidden_states.device.index]
 
         if labels is not None and decoder_input_ids is None and decoder_inputs_embeds is None:
             # get decoder inputs from shifting lm labels to the right
