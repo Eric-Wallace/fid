@@ -120,8 +120,8 @@ def set_encoder_params_from_state(state, args):
 
     override_params = [(param, state[param]) for param in params_to_save if param in state and state[param]]
     for param, value in override_params:
-        if param == 'sequence_length':
-            logger.warning('Using the passed in sequence_length, rather than the checkpoint one')
+        if param == 'sequence_length' or param == 'pretrained_model_cfg':
+            logger.warning('Using the passed in sequence_length and pretrained_model_cfg, rather than the checkpoint one')
             continue
         if hasattr(args, param):
             logger.warning('Overriding args parameter value from checkpoint state. Param = %s, value = %s', param,

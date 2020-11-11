@@ -24,6 +24,7 @@ logger = logging.getLogger()
 def read_serialized_data_from_files(paths: List[str]) -> List:
     results = []
     for i, path in enumerate(paths):
+        print(path)
         with open(path, "rb") as reader:
             logger.info('Reading file %s', path)
             data = pickle.load(reader)

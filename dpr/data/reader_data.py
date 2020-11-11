@@ -111,6 +111,11 @@ with open('NQ-open.dev.jsonl','r') as f:
     for line in f:
         currjson = json.loads(line)
         original_dataset_qa[currjson['question']] = [a.replace('\u00a0',' ') for a in currjson['answer']]
+with open('NQ-efficientqa.jsonl','r') as f:
+    for line in f:
+        currjson = json.loads(line)
+        original_dataset_qa[currjson['question']] = [a.replace('\u00a0',' ') for a in currjson['answer']]
+
 
 def preprocess_retriever_data(samples: List[Dict], gold_info_file: Optional[str], tensorizer: Tensorizer,
                               cfg: ReaderPreprocessingCfg = DEFAULT_PREPROCESSING_CFG_TRAIN,
@@ -150,7 +155,8 @@ def preprocess_retriever_data(samples: List[Dict], gold_info_file: Optional[str]
         if question in canonical_questions:
             question = canonical_questions[question]
         else:
-            print('not in canonical!', question)
+            if question not in original_dataset_qa:
+                print('not in canonical!', question)
 
         sample['answers'] = original_dataset_qa[question]
         
@@ -268,7 +274,7 @@ def _select_reader_passages(sample: Dict,
     answers = sample['answers']
 
     ctxs = [ReaderPassage(**ctx) for ctx in sample['ctxs']][0:max_retriever_passages]
-    answers_token_ids = [tensorizer.text_to_tensor(a, add_special_tokens=False) for a in answers]
+    answers_token_ids = [tensorizer.text_to_tensor(a) for a in answers]
     if is_train_set:
         for ctx in ctxs:
             ctx.answers_token_ids = answers_token_ids
