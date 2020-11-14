@@ -23,6 +23,7 @@ from typing import List
 import numpy as np
 import torch
 
+from utils import symmetric_linear_quantization_params, linear_quantize, linear_dequantize
 from dpr.data.qa_validation import exact_match_score
 from dpr.data.reader_data import ReaderSample, get_best_spans, SpanPrediction, convert_retriever_results
 from dpr.models import init_reader_components
@@ -60,20 +61,24 @@ class ReaderTrainer(object):
 
         tensorizer, reader, optimizer = init_reader_components(args.encoder_model_type, args)
 
-        reader, optimizer = setup_for_distributed_mode(reader, optimizer, args.device, args.n_gpu,
-                                                       args.local_rank,
-                                                       args.fp16,
-                                                       args.fp16_opt_level)
-        self.reader = reader
-        self.optimizer = optimizer
         self.tensorizer = tensorizer
         self.start_epoch = 0
         self.start_batch = 0
         self.scheduler_state = None
         self.best_validation_result = None
         self.best_cp_name = None
+ 
+        self.reader = reader
+        self.optimizer = optimizer
         if saved_state:
             self._load_saved_state(saved_state)
+        reader, optimizer = setup_for_distributed_mode(reader, optimizer, args.device, args.n_gpu,
+                                                       args.local_rank,
+                                                       args.fp16,
+                                                       args.fp16_opt_level)
+        self.reader = reader
+        self.optimizer = optimizer
+
 
     def get_data_iterator(self, path: str, batch_size: int, is_train: bool, shuffle=True,
                           shuffle_seed: int = 0,
@@ -176,8 +181,8 @@ class ReaderTrainer(object):
                 generated_ids = self.reader(input.input_ids, input_attn_mask)
                 batch_predictions = self.tensorizer.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
-            all_results.extend(batch_predictions)
             for i in range(len(samples_batch)):
+                all_results.append((batch_predictions[i], samples_batch[i].question))
                 all_answers.append(samples_batch[i].answers)
 
             if (i + 1) % log_result_step == 0:
@@ -185,7 +190,7 @@ class ReaderTrainer(object):
 
         ems = defaultdict(list)
         for prediction, gold_answers in zip(all_results, all_answers):
-            em_hit = max([exact_match_score(prediction, ga) for ga in gold_answers])
+            em_hit = max([exact_match_score(prediction[0], ga) for ga in gold_answers])
             ems[0].append(em_hit)
         em = 0
         for n in sorted(ems.keys()):
@@ -302,7 +307,12 @@ class ReaderTrainer(object):
         model_to_load = get_model_obj(self.reader)
         if saved_state.model_dict:
             logger.info('Loading model weights from saved state ...')
-            model_to_load.load_state_dict(saved_state.model_dict)
+            state_dict = saved_state.model_dict
+            for key in state_dict:
+                 weight, scale =  state_dict[key]
+                 weight = linear_dequantize(weight, scale, torch.zeros(1), inplace=False)
+                 state_dict[key] = weight
+            model_to_load.load_state_dict(state_dict)
 
         logger.info('Loading saved optimizer state ...')
         if saved_state.optimizer_dict:
@@ -430,20 +440,31 @@ class ReaderTrainer(object):
         with open(out_file, 'w', encoding="utf-8") as output:
             save_results = []
             for r in prediction_results:
-                save_results.append({
-                    'question': r.id,
-                    'gold_answers': r.gold_answers,
-                    'predictions': [{
-                        'top_k': top_k,
-                        'prediction': {
-                            'text': span_pred.prediction_text,
-                            'score': span_pred.span_score,
-                            'relevance_score': span_pred.relevance_score,
-                            'passage_idx': span_pred.passage_index,
-                            'passage': self.tensorizer.to_string(span_pred.passage_token_ids)
-                        }
-                    } for top_k, span_pred in r.predictions.items()]
-                })
+                if 'prediction' in r and 'score' in r['prediction']:
+                    save_results.append({
+                        'question': r.id,
+                        'gold_answers': r.gold_answers,
+                        'predictions': [{
+                            'top_k': top_k,
+                            'prediction': {
+                                'text': span_pred.prediction_text,
+                                'score': span_pred.span_score,
+                                'relevance_score': span_pred.relevance_score,
+                                'passage_idx': span_pred.passage_index,
+                                'passage': self.tensorizer.to_string(span_pred.passage_token_ids)
+                            }
+                        } for top_k, span_pred in r.predictions.items()]
+                    })
+                else:
+                    save_results.append({
+                        'question': r[1],
+                        'predictions': [{
+                            'prediction': {
+                                'text': r[0],
+                            }
+                        } ]
+                    })
+
             output.write(json.dumps(save_results, indent=4) + "\n")
 
 

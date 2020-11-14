@@ -32,6 +32,8 @@ from dpr.options import add_encoder_params, setup_args_gpu, print_args, set_enco
 from dpr.utils.data_utils import Tensorizer
 from dpr.utils.model_utils import setup_for_distributed_mode, get_model_obj, load_states_from_checkpoint
 from dpr.indexer.faiss_indexers import DenseIndexer, DenseHNSWFlatIndexer, DenseFlatIndexer
+from utils import linear_dequantize
+
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -102,6 +104,17 @@ def parse_qa_csv_file(location) -> Iterator[Tuple[str, List[str]]]:
             answers = eval(row[1])
             yield question, answers
 
+def parse_qa_json_file(location) -> Iterator[Tuple[str, List[str]]]:
+    with open(location) as ifile:
+        for line in ifile:
+            myjson = json.loads(line)
+            question = myjson['question']
+            if 'answer' in myjson:
+                answers = myjson['answer']
+            else:
+                answers = None
+            yield question, answers
+
 
 def validate(passages: Dict[object, Tuple[str, str]], answers: List[List[str]],
              result_ctx_ids: List[Tuple[List[object], List[float]]],
@@ -141,28 +154,48 @@ def save_results(passages: Dict[object, Tuple[str, str]], questions: List[str], 
                  ):
     # join passages text with the result ids, their questions and assigning has|no answer labels
     merged_data = []
-    assert len(per_question_hits) == len(questions) == len(answers)
+    if per_question_hits != None:
+        assert len(per_question_hits) == len(questions) == len(answers)
     for i, q in enumerate(questions):
         q_answers = answers[i]
         results_and_scores = top_passages_and_scores[i]
-        hits = per_question_hits[i]
+        if per_question_hits != None:
+            hits = per_question_hits[i]
+        else:
+            hits = None
+        # docs = [passages[int(doc_id)] for doc_id in results_and_scores[0]]
         docs = [passages[doc_id] for doc_id in results_and_scores[0]]
         scores = [str(score) for score in results_and_scores[1]]
-        ctxs_num = len(hits)
+        ctxs_num = len(docs) # len(hits)
 
-        merged_data.append({
-            'question': q,
-            'answers': q_answers,
-            'ctxs': [
-                {
-                    'id': results_and_scores[0][c],
-                    'title': docs[c][1],
-                    'text': docs[c][0],
-                    'score': scores[c],
-                    'has_answer': hits[c],
-                } for c in range(ctxs_num)
-            ]
-        })
+        if hits is None:
+               merged_data.append({
+                'question': q,
+                'answers': ['Nothing'],
+                'ctxs': [
+                    {
+                        'id': results_and_scores[0][c],
+                        'title': docs[c][1],
+                        'text': docs[c][0],
+                        'score': scores[c],
+                    } for c in range(ctxs_num)
+                ]
+            })
+
+        else:
+            merged_data.append({
+                'question': q,
+                'answers': q_answers,
+                'ctxs': [
+                    {
+                        'id': results_and_scores[0][c],
+                        'title': docs[c][1],
+                        'text': docs[c][0],
+                        'score': scores[c],
+                        'has_answer': hits[c],
+                    } for c in range(ctxs_num)
+                ]
+            })
 
     with open(out_file, "w") as writer:
         writer.write(json.dumps(merged_data, indent=4) + "\n")
@@ -199,23 +232,30 @@ def main(args):
     prefix_len = len('question_model.')
     question_encoder_state = {key[prefix_len:]: value for (key, value) in saved_state.model_dict.items() if
                               key.startswith('question_model.')}
-    model_to_load.load_state_dict(question_encoder_state)
+    for key in question_encoder_state:
+        weight, scale =  question_encoder_state[key]
+        weight = linear_dequantize(weight, scale, torch.zeros(1), inplace=False)
+        question_encoder_state[key] = weight
+    model_to_load.load_state_dict(question_encoder_state, strict=False)
     vector_size = model_to_load.get_out_size()
     logger.info('Encoder vector_size=%d', vector_size)
 
     if args.hnsw_index:
         index = DenseHNSWFlatIndexer(vector_size, args.index_buffer)
     else:
-        index = DenseFlatIndexer(vector_size, args.index_buffer)
+        print(args.index_factory_string)
+        print(args.pca_dim)
+        index = DenseFlatIndexer(vector_size, args.index_buffer, args.index_factory_string, args.pca_dim)
 
     retriever = DenseRetriever(encoder, args.batch_size, tensorizer, index)
 
 
     # index all passages
-    ctx_files_pattern = args.encoded_ctx_file
-    input_paths = glob.glob(ctx_files_pattern)
+    # ctx_files_pattern = args.encoded_ctx_file
+    # input_paths = glob.glob(ctx_files_pattern)
 
-    index_path = "_".join(input_paths[0].split("_")[:-1])
+    #index_path = "_".join(input_paths[0].split("_")[:-1])
+    index_path = args.encoded_ctx_file
     if args.save_or_load_index and (os.path.exists(index_path) or os.path.exists(index_path + ".index.dpr")):
         retriever.index.deserialize_from(index_path)
     else:
@@ -227,7 +267,7 @@ def main(args):
     questions = []
     question_answers = []
 
-    for ds_item in parse_qa_csv_file(args.qa_file):
+    for ds_item in parse_qa_json_file(args.qa_file):
         question, answers = ds_item
         questions.append(question)
         question_answers.append(answers)
@@ -236,14 +276,20 @@ def main(args):
 
     # get top k results
     top_ids_and_scores = retriever.get_top_docs(questions_tensor.numpy(), args.n_docs)
+    #all_passages = {}
+    #for item in top_ids_and_scores:
+    #    for paragraph_id in item:
+    #        all_passages[int(paragraph_id)] = None
 
+    #all_passages = unzip_gpt2(all_passages)
     all_passages = load_passages(args.ctx_file)
 
     if len(all_passages) == 0:
         raise RuntimeError('No passages data found. Please specify ctx_file param properly.')
 
-    questions_doc_hits = validate(all_passages, question_answers, top_ids_and_scores, args.validation_workers,
-                                  args.match)
+    questions_doc_hits = None
+    #if question_answers[0] != None:
+    #    questions_doc_hits = validate(all_passages, question_answers, top_ids_and_scores, args.validation_workers, args.match)
 
     if args.out_file:
         save_results(all_passages, questions, question_answers, top_ids_and_scores, questions_doc_hits, args.out_file)
@@ -273,6 +319,8 @@ if __name__ == '__main__':
     parser.add_argument('--index_buffer', type=int, default=50000,
                         help="Temporal memory data buffer size (in samples) for indexer")
     parser.add_argument("--hnsw_index", action='store_true', help='If enabled, use inference time efficient HNSW index')
+    parser.add_argument("--index_factory_string", type=str, help='Type of index to use, for example "PCARx,...,SQ8"')
+    parser.add_argument("--pca_dim", type=int, help='dim to projct down to')
     parser.add_argument("--save_or_load_index", action='store_true', help='If enabled, save index')
 
     args = parser.parse_args()

@@ -102,19 +102,19 @@ DEFAULT_PREPROCESSING_CFG_TRAIN = ReaderPreprocessingCfg(use_tailing_sep=False, 
 DEFAULT_EVAL_PASSAGES = 100
 
 
-original_dataset_qa = {}
-with open('NQ-open.train.jsonl','r') as f:
-    for line in f:
-        currjson = json.loads(line)
-        original_dataset_qa[currjson['question']] = [a.replace('\u00a0',' ') for a in currjson['answer']]
-with open('NQ-open.dev.jsonl','r') as f:
-    for line in f:
-        currjson = json.loads(line)
-        original_dataset_qa[currjson['question']] = [a.replace('\u00a0',' ') for a in currjson['answer']]
-with open('NQ-efficientqa.jsonl','r') as f:
-    for line in f:
-        currjson = json.loads(line)
-        original_dataset_qa[currjson['question']] = [a.replace('\u00a0',' ') for a in currjson['answer']]
+#original_dataset_qa = {}
+#with open('NQ-open.train.jsonl','r') as f:
+#    for line in f:
+#        currjson = json.loads(line)
+#        original_dataset_qa[currjson['question']] = [a.replace('\u00a0',' ') for a in currjson['answer']]
+#with open('NQ-open.dev.jsonl','r') as f:
+#    for line in f:
+#        currjson = json.loads(line)
+#        original_dataset_qa[currjson['question']] = [a.replace('\u00a0',' ') for a in currjson['answer']]
+#with open('NQ-efficientqa.jsonl','r') as f:
+#    for line in f:
+#        currjson = json.loads(line)
+#        original_dataset_qa[currjson['question']] = [a.replace('\u00a0',' ') for a in currjson['answer']]
 
 
 def preprocess_retriever_data(samples: List[Dict], gold_info_file: Optional[str], tensorizer: Tensorizer,
@@ -130,7 +130,7 @@ def preprocess_retriever_data(samples: List[Dict], gold_info_file: Optional[str]
     :return: iterable of ReaderSample objects which can be consumed by the reader model
     """
     
-    assert gold_info_file is not None
+    #######################assert gold_info_file is not None
     gold_passage_map, canonical_questions = _get_gold_ctx_dict(gold_info_file) if gold_info_file else ({}, {})
 
     no_positive_passages = 0
@@ -155,10 +155,11 @@ def preprocess_retriever_data(samples: List[Dict], gold_info_file: Optional[str]
         if question in canonical_questions:
             question = canonical_questions[question]
         else:
-            if question not in original_dataset_qa:
-                print('not in canonical!', question)
+            pass
+            #if question not in original_dataset_qa:
+            #print('not in canonical!', question)
 
-        sample['answers'] = original_dataset_qa[question]
+        # sample['answers'] = original_dataset_qa[question]
         
         passages = _select_reader_passages(sample, question,
                                            tensorizer,

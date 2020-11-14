@@ -12,6 +12,7 @@
 import os
 import time
 import logging
+import random
 import pickle
 from typing import List, Tuple, Iterator
 
@@ -23,13 +24,30 @@ logger = logging.getLogger()
 
 class DenseIndexer(object):
 
-    def __init__(self, buffer_size: int = 50000):
+    def __init__(self, buffer_size: int = 50000, pca_dim = None):
         self.buffer_size = buffer_size
         self.index_id_to_db_id = []
         self.index = None
+        self.pca_dim = pca_dim
+
+    def train_quantizer(self, data):
+
+        db_ids = [t[0] for t in data]
+
+        data = random.sample(data, 60 * 65536)
+        vectors = [np.reshape(t[1], (1, -1)) for t in data]
+        vectors = np.concatenate(vectors, axis=0)
+
+        if not self.index.is_trained:
+            print("training product quantizer")
+            index_ivf = faiss.extract_index_ivf(self.index)
+            clustering_index = faiss.index_cpu_to_all_gpus(faiss.IndexFlatL2(self.pca_dim))
+            index_ivf.clustering_index = clustering_index
+            self.index.train(vectors)
 
     def index_data(self, vector_files: List[str]):
         start_time = time.time()
+        self.train_quantizer(list(iterate_encoded_files(vector_files)))
         buffer = []
         for i, item in enumerate(iterate_encoded_files(vector_files)):
             db_id, doc_vector = item
@@ -90,9 +108,12 @@ class DenseIndexer(object):
 
 class DenseFlatIndexer(DenseIndexer):
 
-    def __init__(self, vector_sz: int, buffer_size: int = 50000):
-        super(DenseFlatIndexer, self).__init__(buffer_size=buffer_size)
+    def __init__(self, vector_sz: int, buffer_size: int = 50000, index_factory_string: str = None, pca_dim : int = None):
+        super(DenseFlatIndexer, self).__init__(buffer_size=buffer_size, pca_dim = pca_dim)
         self.index = faiss.IndexFlatIP(vector_sz)
+        if index_factory_string:
+            self.index = faiss.index_factory(vector_sz, index_factory_string, faiss.METRIC_INNER_PRODUCT)
+            self.index.nprobe = 32
 
     def _index_batch(self, data: List[Tuple[object, np.array]]):
         db_ids = [t[0] for t in data]
